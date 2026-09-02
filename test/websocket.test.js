@@ -92,7 +92,9 @@ describe('WebSocket', () => {
         assert.strictEqual(count, 2);
       });
 
-      it('accepts the `maxPayload` option', (done) => {
+      it('accepts the receiver limit options', (done) => {
+        const maxBufferedChunks = 1024;
+        const maxFragments = 512;
         const maxPayload = 20480;
         const wss = new WebSocket.Server(
           {
@@ -102,10 +104,17 @@ describe('WebSocket', () => {
           () => {
             const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
               perMessageDeflate: true,
+              maxBufferedChunks,
+              maxFragments,
               maxPayload
             });
 
             ws.on('open', () => {
+              assert.strictEqual(
+                ws._receiver._maxBufferedChunks,
+                maxBufferedChunks
+              );
+              assert.strictEqual(ws._receiver._maxFragments, maxFragments);
               assert.strictEqual(ws._receiver._maxPayload, maxPayload);
               assert.strictEqual(
                 ws._receiver._extensions['permessage-deflate']._maxPayload,
@@ -115,6 +124,22 @@ describe('WebSocket', () => {
             });
           }
         );
+
+        wss.on('connection', (ws) => {
+          ws.close();
+        });
+      });
+
+      it('uses non-zero receiver limits by default', (done) => {
+        const wss = new WebSocket.Server({ port: 0 }, () => {
+          const ws = new WebSocket(`ws://localhost:${wss.address().port}`);
+
+          ws.on('open', () => {
+            assert.strictEqual(ws._receiver._maxBufferedChunks, 256 * 1024);
+            assert.strictEqual(ws._receiver._maxFragments, 16 * 1024);
+            wss.close(done);
+          });
+        });
 
         wss.on('connection', (ws) => {
           ws.close();
@@ -585,6 +610,47 @@ describe('WebSocket', () => {
         });
 
         ws._socket.write(Buffer.from([0x85, 0x00]));
+      });
+    });
+
+    it("emits an 'error' event if there are too many message fragments", (done) => {
+      let clientCloseEventEmitted = false;
+      let serverClientCloseEventEmitted = false;
+
+      const wss = new WebSocket.Server({ port: 0 }, () => {
+        const ws = new WebSocket(`ws://localhost:${wss.address().port}`, {
+          maxFragments: 2
+        });
+
+        ws.on('error', (err) => {
+          assert.ok(err instanceof RangeError);
+          assert.strictEqual(err.code, 'WS_ERR_TOO_MANY_BUFFERED_PARTS');
+          assert.strictEqual(err.message, 'Too many message fragments');
+
+          ws.on('close', (code, reason) => {
+            assert.strictEqual(code, 1006);
+            assert.strictEqual(reason, EMPTY_BUFFER);
+
+            clientCloseEventEmitted = true;
+            if (serverClientCloseEventEmitted) wss.close(done);
+          });
+        });
+      });
+
+      wss.on('connection', (ws) => {
+        ws.on('close', (code, reason) => {
+          assert.strictEqual(code, 1008);
+          assert.deepStrictEqual(reason, EMPTY_BUFFER);
+
+          serverClientCloseEventEmitted = true;
+          if (clientCloseEventEmitted) wss.close(done);
+        });
+
+        //
+        // Three empty, non-final data fragments. The third one exceeds the
+        // `maxFragments` limit of the client.
+        //
+        ws._socket.write(Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x00]));
       });
     });
 
